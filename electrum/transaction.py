@@ -27,7 +27,7 @@
 
 # Note: The deserialization code originally comes from ABE.
 
-from typing import Sequence, Union
+from typing import Sequence, Union, NamedTuple, Tuple, Optional, Iterable
 
 from .util import print_error, profiler
 
@@ -57,6 +57,20 @@ class UnknownTxinType(Exception):
 
 class NotRecognizedRedeemScript(Exception):
     pass
+
+
+class MalformedBitcoinScript(Exception):
+    pass
+
+
+TxOutput = NamedTuple("TxOutput", [('type', int), ('address', str), ('value', Union[int, str])])
+# ^ value is str when the output is set to max: '!'
+
+
+TxOutputHwInfo = NamedTuple("TxOutputHwInfo", [('address_index', Tuple),
+                                               ('sorted_xpubs', Iterable[str]),
+                                               ('num_sig', Optional[int]),
+                                               ('script_type', str)])
 
 
 class BCDataStream(object):
@@ -253,13 +267,16 @@ def script_GetOp(_bytes : bytes):
         if opcode <= opcodes.OP_PUSHDATA4:
             nSize = opcode
             if opcode == opcodes.OP_PUSHDATA1:
-                nSize = _bytes[i]
+                try: nSize = _bytes[i]
+                except IndexError: raise MalformedBitcoinScript()
                 i += 1
             elif opcode == opcodes.OP_PUSHDATA2:
-                (nSize,) = struct.unpack_from('<H', _bytes, i)
+                try: (nSize,) = struct.unpack_from('<H', _bytes, i)
+                except struct.error: raise MalformedBitcoinScript()
                 i += 2
             elif opcode == opcodes.OP_PUSHDATA4:
-                (nSize,) = struct.unpack_from('<I', _bytes, i)
+                try: (nSize,) = struct.unpack_from('<I', _bytes, i)
+                except struct.error: raise MalformedBitcoinScript()
                 i += 4
             vch = _bytes[i:i + nSize]
             i += nSize
@@ -271,21 +288,11 @@ def script_GetOpName(opcode):
     return (opcodes.whatis(opcode)).replace("OP_", "")
 
 
-def decode_script(bytes):
-    result = ''
-    for (opcode, vch, i) in script_GetOp(bytes):
-        if len(result) > 0: result += " "
-        if opcode <= opcodes.OP_PUSHDATA4:
-            result += "%d:"%(opcode,)
-            result += short_hex(vch)
-        else:
-            result += script_GetOpName(opcode)
-    return result
-
-
 def match_decoded(decoded, to_match):
+    if decoded is None:
+        return False
     if len(decoded) != len(to_match):
-        return False;
+        return False
     for i in range(len(decoded)):
         if to_match[i] == opcodes.OP_PUSHDATA4 and decoded[i][0] <= opcodes.OP_PUSHDATA4 and decoded[i][0]>0:
             continue  # Opcodes below OP_PUSHDATA4 all just push data onto stack, and are equivalent.
@@ -403,7 +410,10 @@ def parse_scriptSig(d, _bytes):
 
 
 def parse_redeemScript_multisig(redeem_script: bytes):
-    dec2 = [ x for x in script_GetOp(redeem_script) ]
+    try:
+        dec2 = [ x for x in script_GetOp(redeem_script) ]
+    except MalformedBitcoinScript:
+        raise NotRecognizedRedeemScript()
     try:
         m = dec2[0][0] - opcodes.OP_1 + 1
         n = dec2[-2][0] - opcodes.OP_1 + 1
@@ -424,7 +434,10 @@ def parse_redeemScript_multisig(redeem_script: bytes):
 
 
 def get_address_from_output_script(_bytes, *, net=None):
-    decoded = [x for x in script_GetOp(_bytes)]
+    try:
+        decoded = [x for x in script_GetOp(_bytes)]
+    except MalformedBitcoinScript:
+        decoded = None
 
     # The Genesis Block, self-payments, and pay-by-IP-address payments look like:
     # 65 BYTES:... CHECKSIG
@@ -672,7 +685,7 @@ class Transaction:
 
         `signatures` is expected to be a list of sigs with signatures[i]
         intended for self._inputs[i].
-        This is used by the Trezor and KeepKey plugins.
+        This is used by the Trezor, KeepKey an Safe-T plugins.
         """
         if self.is_complete():
             return
@@ -721,7 +734,7 @@ class Transaction:
             return
         d = deserialize(self.raw, force_full_parse)
         self._inputs = d['inputs']
-        self._outputs = [(x['type'], x['address'], x['value']) for x in d['outputs']]
+        self._outputs = [TxOutput(x['type'], x['address'], x['value']) for x in d['outputs']]
         self.locktime = d['lockTime']
         self.version = d['version']
         self.is_partial_originally = d['partial']
@@ -1180,17 +1193,17 @@ class Transaction:
 
     def get_outputs(self):
         """convert pubkeys to addresses"""
-        o = []
-        for type, x, v in self.outputs():
-            if type == TYPE_ADDRESS:
-                addr = x
-            elif type == TYPE_PUBKEY:
+        outputs = []
+        for o in self.outputs():
+            if o.type == TYPE_ADDRESS:
+                addr = o.address
+            elif o.type == TYPE_PUBKEY:
                 # TODO do we really want this conversion? it's not really that address after all
-                addr = bitcoin.public_key_to_p2pkh(bfh(x))
+                addr = bitcoin.public_key_to_p2pkh(bfh(o.address))
             else:
-                addr = 'SCRIPT ' + x
-            o.append((addr,v))      # consider using yield (addr, v)
-        return o
+                addr = 'SCRIPT ' + o.address
+            outputs.append((addr, o.value))      # consider using yield (addr, v)
+        return outputs
 
     def get_output_addresses(self):
         return [addr for addr, val in self.get_outputs()]

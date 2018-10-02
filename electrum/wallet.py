@@ -43,7 +43,7 @@ from .i18n import _
 from .util import (NotEnoughFunds, PrintError, UserCancelled, profiler,
                    format_satoshis, format_fee_satoshis, NoDynamicFeeEstimates,
                    TimeoutException, WalletFileException, BitcoinException,
-                   InvalidPassword)
+                   InvalidPassword, format_time)
 
 from .bitcoin import *
 from .version import *
@@ -51,7 +51,7 @@ from .keystore import load_keystore, Hardware_KeyStore
 from .storage import multisig_type, STO_EV_PLAINTEXT, STO_EV_USER_PW, STO_EV_XPUB_PW
 
 from . import transaction, bitcoin, coinchooser, paymentrequest, contacts
-from .transaction import Transaction
+from .transaction import Transaction, TxOutput, TxOutputHwInfo
 from .plugin import run_hook
 from .address_synchronizer import (AddressSynchronizer, TX_HEIGHT_LOCAL,
                                    TX_HEIGHT_UNCONF_PARENT, TX_HEIGHT_UNCONFIRMED)
@@ -133,7 +133,7 @@ def sweep(privkeys, network, config, recipient, fee=None, imax=100):
     inputs, keypairs = sweep_preparations(privkeys, network, imax)
     total = sum(i.get('value') for i in inputs)
     if fee is None:
-        outputs = [(TYPE_ADDRESS, recipient, total)]
+        outputs = [TxOutput(TYPE_ADDRESS, recipient, total)]
         tx = Transaction.from_io(inputs, outputs)
         fee = config.estimate_fee(tx.estimated_size())
     if total - fee < 0:
@@ -141,7 +141,7 @@ def sweep(privkeys, network, config, recipient, fee=None, imax=100):
     if total - fee < dust_threshold(network):
         raise Exception(_('Not enough funds on address.') + '\nTotal: %d satoshis\nFee: %d\nDust Threshold: %d'%(total, fee, dust_threshold(network)))
 
-    outputs = [(TYPE_ADDRESS, recipient, total - fee)]
+    outputs = [TxOutput(TYPE_ADDRESS, recipient, total - fee)]
     locktime = network.get_local_height()
 
     tx = Transaction.from_io(inputs, outputs, locktime=locktime)
@@ -178,6 +178,8 @@ class Abstract_Wallet(AddressSynchronizer):
         self.frozen_addresses      = set(storage.get('frozen_addresses',[]))
         self.fiat_value            = storage.get('fiat_value', {})
         self.receive_requests      = storage.get('payment_requests', {})
+
+        self.calc_unused_change_addresses()
 
         # save wallet type the first time
         if self.storage.get('wallet_type') is None:
@@ -224,6 +226,16 @@ class Abstract_Wallet(AddressSynchronizer):
 
     def synchronize(self):
         pass
+
+    def calc_unused_change_addresses(self):
+        with self.lock:
+            if hasattr(self, '_unused_change_addresses'):
+                addrs = self._unused_change_addresses
+            else:
+                addrs = self.get_change_addresses()
+            self._unused_change_addresses = [addr for addr in addrs if
+                                            self.get_address_history_len(addr) == 0]
+            return list(self._unused_change_addresses)
 
     def is_deterministic(self):
         return self.keystore.is_deterministic()
@@ -272,8 +284,6 @@ class Abstract_Wallet(AddressSynchronizer):
             return
 
     def is_mine(self, address):
-        if not super().is_mine(address):
-            return False
         try:
             self.get_address_index(address)
         except KeyError:
@@ -318,7 +328,8 @@ class Abstract_Wallet(AddressSynchronizer):
         if tx.is_complete():
             if tx_hash in self.transactions.keys():
                 label = self.get_label(tx_hash)
-                height, conf, timestamp = self.get_tx_height(tx_hash)
+                tx_mined_status = self.get_tx_height(tx_hash)
+                height, conf = tx_mined_status.height, tx_mined_status.conf
                 if height > 0:
                     if conf:
                         status = _("{} confirmations").format(conf)
@@ -368,8 +379,9 @@ class Abstract_Wallet(AddressSynchronizer):
 
     def balance_at_timestamp(self, domain, target_timestamp):
         h = self.get_history(domain)
-        for tx_hash, height, conf, timestamp, value, balance in h:
-            if timestamp > target_timestamp:
+        balance = 0
+        for tx_hash, tx_mined_status, value, balance in h:
+            if tx_mined_status.timestamp > target_timestamp:
                 return balance - value
         # return last balance
         return balance
@@ -384,21 +396,23 @@ class Abstract_Wallet(AddressSynchronizer):
         fiat_income = Decimal(0)
         fiat_expenditures = Decimal(0)
         h = self.get_history(domain)
-        for tx_hash, height, conf, timestamp, value, balance in h:
-            if from_timestamp and (timestamp or time.time()) < from_timestamp:
+        now = time.time()
+        for tx_hash, tx_mined_status, value, balance in h:
+            timestamp = tx_mined_status.timestamp
+            if from_timestamp and (timestamp or now) < from_timestamp:
                 continue
-            if to_timestamp and (timestamp or time.time()) >= to_timestamp:
+            if to_timestamp and (timestamp or now) >= to_timestamp:
                 continue
             item = {
-                'txid':tx_hash,
-                'height':height,
-                'confirmations':conf,
-                'timestamp':timestamp,
+                'txid': tx_hash,
+                'height': tx_mined_status.height,
+                'confirmations': tx_mined_status.conf,
+                'timestamp': timestamp,
                 'value': Satoshis(value),
-                'balance': Satoshis(balance)
+                'balance': Satoshis(balance),
+                'date': timestamp_to_datetime(timestamp),
+                'label': self.get_label(tx_hash),
             }
-            item['date'] = timestamp_to_datetime(timestamp)
-            item['label'] = self.get_label(tx_hash)
             if show_addresses:
                 tx = self.transactions.get(tx_hash)
                 item['inputs'] = list(map(lambda x: dict((k, x[k]) for k in ('prevout_hash', 'prevout_n')), tx.inputs()))
@@ -413,10 +427,9 @@ class Abstract_Wallet(AddressSynchronizer):
                 income += value
             # fiat computations
             if fx and fx.is_enabled():
-                date = timestamp_to_datetime(timestamp)
                 fiat_value = self.get_fiat_value(tx_hash, fx.ccy)
                 fiat_default = fiat_value is None
-                fiat_value = fiat_value if fiat_value is not None else value / Decimal(COIN) * self.price_at_timestamp(tx_hash, fx.timestamp_rate)
+                fiat_value = fiat_value if fiat_value is not None else value / Decimal(COIN) * self.price_at_timestamp(tx_hash, fx.timestamp_rate)  #
                 item['fiat_value'] = Fiat(fiat_value, fx.ccy)
                 item['fiat_default'] = fiat_default
                 if value < 0:
@@ -483,9 +496,11 @@ class Abstract_Wallet(AddressSynchronizer):
             return ', '.join(labels)
         return ''
 
-    def get_tx_status(self, tx_hash, height, conf, timestamp):
-        from .util import format_time
+    def get_tx_status(self, tx_hash, tx_mined_status):
         extra = []
+        height = tx_mined_status.height
+        conf = tx_mined_status.conf
+        timestamp = tx_mined_status.timestamp
         if conf == 0:
             tx = self.transactions.get(tx_hash)
             if not tx:
@@ -532,11 +547,10 @@ class Abstract_Wallet(AddressSynchronizer):
         # check outputs
         i_max = None
         for i, o in enumerate(outputs):
-            _type, data, value = o
-            if _type == TYPE_ADDRESS:
-                if not is_address(data):
-                    raise Exception("Invalid bitcoin address: {}".format(data))
-            if value == '!':
+            if o.type == TYPE_ADDRESS:
+                if not is_address(o.address):
+                    raise Exception("Invalid bitcoin address: {}".format(o.address))
+            if o.value == '!':
                 if i_max is not None:
                     raise Exception("More than one output set to spend max")
                 i_max = i
@@ -552,21 +566,22 @@ class Abstract_Wallet(AddressSynchronizer):
             self.add_input_info(item)
 
         # change address
+        # if we leave it empty, coin_chooser will set it
+        change_addrs = []
         if change_addr:
             change_addrs = [change_addr]
-        else:
-            addrs = self.get_change_addresses()[-self.gap_limit_for_change:]
-            if self.use_change and addrs:
-                # New change addresses are created only after a few
-                # confirmations.  Select the unused addresses within the
-                # gap limit; if none take one at random
-                change_addrs = [addr for addr in addrs if
-                                self.get_num_tx(addr) == 0]
-                if not change_addrs:
-                    change_addrs = [random.choice(addrs)]
+        elif self.use_change:
+            # Recalc and get unused change addresses
+            addrs = self.calc_unused_change_addresses()
+            # New change addresses are created only after a few
+            # confirmations.
+            if addrs:
+                # if there are any unused, select all
+                change_addrs = addrs
             else:
-                # coin_chooser will set change address
-                change_addrs = []
+                # if there are none, take one randomly from the last few
+                addrs = self.get_change_addresses()[-self.gap_limit_for_change:]
+                change_addrs = [random.choice(addrs)] if addrs else []
 
         # Fee estimator
         if fixed_fee is None:
@@ -587,14 +602,13 @@ class Abstract_Wallet(AddressSynchronizer):
         else:
             # FIXME?? this might spend inputs with negative effective value...
             sendable = sum(map(lambda x:x['value'], inputs))
-            _type, data, value = outputs[i_max]
-            outputs[i_max] = (_type, data, 0)
+            outputs[i_max] = outputs[i_max]._replace(value=0)
             tx = Transaction.from_io(inputs, outputs[:])
             fee = fee_estimator(tx.estimated_size())
             amount = sendable - tx.output_value() - fee
             if amount < 0:
                 raise NotEnoughFunds()
-            outputs[i_max] = (_type, data, amount)
+            outputs[i_max] = outputs[i_max]._replace(value=amount)
             tx = Transaction.from_io(inputs, outputs[:])
 
         # Sort the inputs and outputs deterministically
@@ -629,22 +643,24 @@ class Abstract_Wallet(AddressSynchronizer):
             self.set_up_to_date(False)
             while not self.is_up_to_date():
                 if callback:
-                    msg = "%s\n%s %d"%(
+                    msg = "{}\n{} {}".format(
                         _("Please wait..."),
                         _("Addresses generated:"),
-                        len(self.addresses(True)))
+                        len(self.get_addresses()))
                     callback(msg)
                 time.sleep(0.1)
         def wait_for_network():
             while not self.network.is_connected():
                 if callback:
-                    msg = "%s \n" % (_("Connecting..."))
+                    msg = "{} \n".format(_("Connecting..."))
                     callback(msg)
                 time.sleep(0.1)
         # wait until we are connected, because the user
         # might have selected another server
         if self.network:
+            self.print_error("waiting for network...")
             wait_for_network()
+            self.print_error("waiting while wallet is syncing...")
             wait_for_wallet()
         else:
             self.synchronize()
@@ -688,14 +704,13 @@ class Abstract_Wallet(AddressSynchronizer):
         s = sorted(s, key=lambda x: x[2])
         for o in s:
             i = outputs.index(o)
-            otype, address, value = o
-            if value - delta >= self.dust_threshold():
-                outputs[i] = otype, address, value - delta
+            if o.value - delta >= self.dust_threshold():
+                outputs[i] = o._replace(value=o.value-delta)
                 delta = 0
                 break
             else:
                 del outputs[i]
-                delta -= value
+                delta -= o.value
                 if delta > 0:
                     continue
         if delta > 0:
@@ -708,8 +723,8 @@ class Abstract_Wallet(AddressSynchronizer):
     def cpfp(self, tx, fee):
         txid = tx.txid()
         for i, o in enumerate(tx.outputs()):
-            otype, address, value = o
-            if otype == TYPE_ADDRESS and self.is_mine(address):
+            address, value = o.address, o.value
+            if o.type == TYPE_ADDRESS and self.is_mine(address):
                 break
         else:
             return
@@ -719,7 +734,7 @@ class Abstract_Wallet(AddressSynchronizer):
             return
         self.add_input_info(item)
         inputs = [item]
-        outputs = [(TYPE_ADDRESS, address, value - fee)]
+        outputs = [TxOutput(TYPE_ADDRESS, address, value - fee)]
         locktime = self.get_local_height()
         # note: no need to call tx.BIP_LI01_sort() here - single input/output
         return Transaction.from_io(inputs, outputs, locktime=locktime)
@@ -786,7 +801,8 @@ class Abstract_Wallet(AddressSynchronizer):
                 pubkeys = self.get_public_keys(addr)
                 # sort xpubs using the order of pubkeys
                 sorted_pubkeys, sorted_xpubs = zip(*sorted(zip(pubkeys, xpubs)))
-                info[addr] = index, sorted_xpubs, self.m if isinstance(self, Multisig_Wallet) else None
+                num_sig = self.m if isinstance(self, Multisig_Wallet) else None
+                info[addr] = TxOutputHwInfo(index, sorted_xpubs, num_sig, self.txin_type)
         tx.output_info = info
 
     def sign_transaction(self, tx, password):
@@ -839,8 +855,7 @@ class Abstract_Wallet(AddressSynchronizer):
             txid, n = txo.split(':')
             info = self.verified_tx.get(txid)
             if info:
-                tx_height, timestamp, pos = info
-                conf = local_height - tx_height
+                conf = local_height - info.height
             else:
                 conf = 0
             l.append((conf, v))
@@ -1068,17 +1083,6 @@ class Abstract_Wallet(AddressSynchronizer):
         index = self.get_address_index(addr)
         return self.keystore.decrypt_message(index, message, password)
 
-    def get_depending_transactions(self, tx_hash):
-        """Returns all (grand-)children of tx_hash in this wallet."""
-        children = set()
-        # TODO rewrite this to use self.spent_outpoints
-        for other_hash, tx in self.transactions.items():
-            for input in (tx.inputs()):
-                if input["prevout_hash"] == tx_hash:
-                    children.add(other_hash)
-                    children |= self.get_depending_transactions(other_hash)
-        return children
-
     def txin_value(self, txin):
         txid = txin['prevout_hash']
         prev_n = txin['prevout_n']
@@ -1091,7 +1095,7 @@ class Abstract_Wallet(AddressSynchronizer):
 
     def price_at_timestamp(self, txid, price_func):
         """Returns fiat price of bitcoin at the time tx got confirmed."""
-        height, conf, timestamp = self.get_tx_height(txid)
+        timestamp = self.get_tx_height(txid).timestamp
         return price_func(timestamp if timestamp else time.time())
 
     def unrealized_gains(self, domain, price_func, ccy):
@@ -1218,6 +1222,10 @@ class Imported_Wallet(Simple_Wallet):
     def get_fingerprint(self):
         return ''
 
+    def get_addresses(self):
+        # note: overridden so that the history can be cleared
+        return sorted(self.addresses.keys())
+
     def get_receiving_addresses(self):
         return self.get_addresses()
 
@@ -1258,7 +1266,7 @@ class Imported_Wallet(Simple_Wallet):
                 self.verified_tx.pop(tx_hash, None)
                 self.unverified_tx.pop(tx_hash, None)
                 self.transactions.pop(tx_hash, None)
-            self.storage.put('verified_tx3', self.verified_tx)
+            self.save_verified_tx()
         self.save_transactions()
 
         self.set_label(address, None)
@@ -1350,7 +1358,8 @@ class Deterministic_Wallet(Abstract_Wallet):
         return self.keystore.has_seed()
 
     def get_addresses(self):
-        # overloaded so that addresses are ordered based on derivation
+        # note: overridden so that the history can be cleared.
+        # addresses are ordered based on derivation
         out = []
         out += self.get_receiving_addresses()
         out += self.get_change_addresses()
@@ -1426,6 +1435,9 @@ class Deterministic_Wallet(Abstract_Wallet):
             self._addr_to_addr_index[address] = (for_change, n)
             self.save_addresses()
             self.add_address(address)
+            if for_change:
+                # note: if it's actually used, it will get filtered later
+                self._unused_change_addresses.append(address)
             return address
 
     def synchronize_sequence(self, for_change):
@@ -1661,4 +1673,4 @@ class Wallet(object):
             return Multisig_Wallet
         if wallet_type in wallet_constructors:
             return wallet_constructors[wallet_type]
-        raise RuntimeError("Unknown wallet type: " + str(wallet_type))
+        raise WalletFileException("Unknown wallet type: " + str(wallet_type))
