@@ -16,6 +16,7 @@ env/
 .buildozer/
 bin/
 /app.fil
+*Cache*
 
 # tox files
 .cache/
